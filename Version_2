@@ -1,0 +1,278 @@
+using JuMP
+using HiGHS
+using Distributions
+using Statistics
+using Plots
+using Random
+Random.seed!(42)
+
+# ----------------------------
+# 0. SETTINGS
+# ----------------------------
+Nsim = 200                     # Monte Carlo samples
+sd_temp = 1.5                  # std dev for monthly temperature sampling (°C)
+
+# ----------------------------
+# 1. DATA / PARAMETERS
+# ----------------------------
+T = 1:12
+nT = length(T)
+
+# Hydraulic / load
+Q   = 100_000.0                # m3/d
+Cin = 40.0                     # mg N/L
+Lin = Q * Cin / 1000.0         # kg N/d total influent N
+
+# Days per period (monthly approximation)
+days = fill(365.0 / 12.0, nT)
+
+# Base monthly wastewater temperatures (°C)
+T_base = [
+    6.0,   # Jan
+    6.5,   # Feb
+    8.0,   # Mar
+    10.5,  # Apr
+    14.0,  # May
+    18.0,  # Jun
+    21.0,  # Jul
+    22.0,  # Aug
+    19.0,  # Sep
+    14.5,  # Oct
+    9.0,   # Nov
+    6.5    # Dec
+]
+
+# Reference efficiencies & energy intensities (placeholders)
+eta_DNA_ref = 0.90                 # conventional (assumed constant)
+eta_PNA_ref = 0.85                 # anammox reference at T_ref
+
+# energy intensities (kWh per kg N removed)
+e_DNA = fill(4.0, nT)
+e_PNA = fill(1.0, nT)
+
+# heating energy model: per °C per m3 per day (kWh per °C per m3/day)
+heat_energy_per_deg = 0.0005       # kWh per °C per m3
+
+# Effluent TN limit
+TN_target = 10.0                   # mg/L
+
+# Emissions & costs
+c_elec  = 0.10                     # $/kWh
+EF_elec = 0.4                      # kg CO2e / kWh (grid intensity)
+EF_DNA_ref = 2.0                   # kg CO2e per kg N removed (process N2O etc.)
+EF_PNA_ref = 0.5                   # kg CO2e per kg N removed
+SCC = 80.0                         # $ / tCO2e
+AnnualCapex_PNA = 500_000.0        # $/yr (annualized capex when PNA is built)
+
+# θ-coefficient for temperature dependence of anammox kinetics
+θ = 1.07
+T_ref = 20.0
+
+# Big-M for heating degrees (max heating allowed)
+M_heat = 20.0   # max degrees you would ever add (°C)
+
+# ----------------------------
+# 2. helper: anammox eff from temperature
+# ----------------------------
+function eta_pna_from_temp(T_eff;
+        eta_ref=eta_PNA_ref, θ_local=θ, Tref=T_ref)
+    eff = eta_ref * θ_local^(T_eff - Tref)
+    return clamp(eff, 0.01, 0.99)
+end
+
+# quick curve for plotting efficiency vs temperature
+temps_plot = collect(0.0:0.5:30.0)
+eta_plot = [eta_pna_from_temp(Tp) for Tp in temps_plot]
+
+# ----------------------------
+# 3. solve single MILP for one sampled vector of monthly temps
+# ----------------------------
+function solve_milp_for_monthly_temps(T_sample; allow_PNA=true, verbose=false)
+    # T_sample: vector length nT of temperatures (°C) for each month
+    model = Model(HiGHS.Optimizer)
+    set_silent(model)
+
+    # decision variables
+    @variables(model, begin
+        0 <= x_DNA <= 1             # fraction to DNA
+        0 <= x_PNA <= 1             # fraction to PNA
+        y_PNA, Bin                  # build PNA?
+        0 <= heat_deg[m=1:nT]      # degrees added each month (continuous)
+        y_heat[m=1:nT], Bin         # whether we heat month m
+        0 <= z[m=1:nT]              # auxiliary var z_m = x_PNA * heat_deg[m] (McCormick)
+        Ceff[m=1:nT]                # effluent TN (mg/L) per month
+    end)
+
+    # routing constraint
+    @constraint(model, x_DNA + x_PNA == 1.0)
+
+    if allow_PNA
+        @constraint(model, x_PNA <= y_PNA)          # only route if built
+        # heating only allowed if plant built
+        @constraint(model, [m=1:nT], y_heat[m] <= y_PNA)
+        # heat_deg only if y_heat on
+        @constraint(model, [m=1:nT], heat_deg[m] <= M_heat * y_heat[m])
+    else
+        @constraint(model, x_PNA == 0.0)
+        @constraint(model, y_PNA == 0.0)
+        @constraint(model, [m=1:nT], heat_deg[m] == 0.0)
+        @constraint(model, [m=1:nT], y_heat[m] == 0.0)
+    end
+
+    # Loads to each process (kgN/d) — these are scalar JuMP expressions
+    @expression(model, L_DNA, x_DNA * Lin)
+    @expression(model, L_PNA, x_PNA * Lin)
+
+    # compute base eta (Float64 per month) and slope (Float64 per month)
+    base_eta = [eta_pna_from_temp(T_sample[m]) for m in 1:nT]
+    slope = Float64[]
+    Δ = 0.1
+    for m in 1:nT
+        e_hi = eta_pna_from_temp(T_sample[m] + Δ)
+        e_lo = eta_pna_from_temp(T_sample[m] - Δ)
+        push!(slope, (e_hi - e_lo) / (2Δ))
+    end
+
+    # McCormick linearization for z_m = x_PNA * heat_deg[m]
+    # bounds: x_PNA ∈ [0,1], heat_deg[m] ∈ [0, M_heat]
+    # Constraints:
+    #   z >= 0
+    #   z >= heat_deg - M_heat * (1 - x_PNA)
+    #   z <= heat_deg
+    #   z <= M_heat * x_PNA
+    @constraint(model, [m=1:nT], z[m] >= 0)
+    @constraint(model, [m=1:nT], z[m] >= heat_deg[m] - M_heat * (1 - x_PNA))
+    @constraint(model, [m=1:nT], z[m] <= heat_deg[m])
+    @constraint(model, [m=1:nT], z[m] <= M_heat * x_PNA)
+
+    # N removed in each month (kg N/day)
+    # R_PNA = base_eta[m] * L_PNA + slope[m] * Lin * z[m]
+    # base_eta * L_PNA = base_eta[m] * Lin * x_PNA  (linear)
+    @expression(model, R_DNA[m=1:nT], eta_DNA_ref * L_DNA)
+    @expression(model, R_PNA[m=1:nT], base_eta[m] * Lin * x_PNA + slope[m] * Lin * z[m])
+
+    # effluent TN (mg/L) per month
+    @constraint(model, [m=1:nT], Ceff[m] == (Lin - R_DNA[m] - R_PNA[m]) / Q * 1000.0)
+
+    # effluent limit
+    @constraint(model, [m=1:nT], Ceff[m] <= TN_target)
+
+    # Energies (kWh/day)
+    @expression(model, E_DNA[m=1:nT], e_DNA[m] * R_DNA[m])
+    @expression(model, E_PNA[m=1:nT], e_PNA[m] * R_PNA[m])
+    # heating energy: heat_deg (°C) * heat_energy_per_deg (kWh/°C/m3) * Q (m3/d)
+    @expression(model, E_heat[m=1:nT], heat_deg[m] * heat_energy_per_deg * Q)
+    @expression(model, E_total[m=1:nT], E_DNA[m] + E_PNA[m] + E_heat[m])
+
+    # annual energy cost
+    @expression(model, Cost_energy, sum(days[m] * c_elec * E_total[m] for m in 1:nT))
+
+    # emissions (kg CO2e/day)
+    @expression(model, CO2_total[m=1:nT],
+        E_total[m] * EF_elec + R_DNA[m] * EF_DNA_ref + R_PNA[m] * EF_PNA_ref)
+
+    @expression(model, Cost_GHG, sum(days[m] * CO2_total[m] * (SCC / 1000.0) for m in 1:nT))
+
+    # objective: annualized capex + energy + GHG cost
+    @objective(model, Min, y_PNA * AnnualCapex_PNA + Cost_energy + Cost_GHG)
+
+    optimize!(model)
+    status = termination_status(model)
+
+    return (
+        status = status,
+        x_DNA = value(x_DNA),
+        x_PNA = value(x_PNA),
+        y_PNA = Int(round(value(y_PNA))),
+        heat_deg = [value(heat_deg[m]) for m in 1:nT],
+        y_heat = [Int(round(value(y_heat[m]))) for m in 1:nT],
+        z = [value(z[m]) for m in 1:nT],
+        R_PNA = [value(R_PNA[m]) for m in 1:nT],
+        Ceff = [value(Ceff[m]) for m in 1:nT],
+        E_total = [value(E_total[m]) for m in 1:nT],
+        CO2_total = [value(CO2_total[m]) for m in 1:nT],
+        Cost_energy = value(Cost_energy),
+        Cost_GHG = value(Cost_GHG),
+        Cost_total = value(y_PNA) * AnnualCapex_PNA + value(Cost_energy) + value(Cost_GHG)
+    )
+end
+
+# ----------------------------
+# 4. Monte Carlo loop
+# ----------------------------
+println("Running Monte Carlo with Nsim = $Nsim ...")
+results = Dict(
+    :xPNA => Float64[],
+    :yPNA => Int[],
+    :total_cost => Float64[],
+    :avg_heat_deg => Float64[],
+    :etaPNA_avg => Float64[],
+    :sampled_temps => Vector{Vector{Float64}}()  # store the sampled temp vector if desired
+)
+
+for sim in 1:Nsim
+    # sample monthly temperatures (independent draws per month)
+    T_sample = [rand(Normal(T_base[m], sd_temp)) for m in 1:nT]
+
+    sol = solve_milp_for_monthly_temps(T_sample, allow_PNA=true, verbose=false)
+
+    push!(results[:xPNA], sol.x_PNA)
+    push!(results[:yPNA], sol.y_PNA)
+    push!(results[:total_cost], sol.Cost_total)
+    push!(results[:avg_heat_deg], mean(sol.heat_deg))
+    # approximate average etaPNA across months using base_eta + slope*z/x_PNA if x_PNA>0 else base
+    # compute per-sim average estimated PNA efficiency (for reporting)
+    # (we can approximate via R_PNA / (Lin * x_PNA) when x_PNA>0)
+    est_eta = 0.0
+    if sol.x_PNA > 1e-9
+        # average over months: sum(R_PNA[m]) / (Lin * x_PNA * n_months) would give mean (but R_PNA already per day)
+        est_eta = mean([r / (Lin * sol.x_PNA + 1e-12) for r in sol.R_PNA])  # small denom guard
+    else
+        est_eta = mean([eta_pna_from_temp(mean(T_sample))])  # fallback
+    end
+    push!(results[:etaPNA_avg], est_eta)
+    push!(results[:sampled_temps], T_sample)
+end
+
+# ----------------------------
+# 5. Summaries & plots
+# ----------------------------
+avg_pct_PNA = mean(results[:xPNA]) * 100.0
+frac_built = sum(results[:yPNA]) / Nsim
+cost_mean = mean(results[:total_cost])
+cost_min  = minimum(results[:total_cost])
+cost_max  = maximum(results[:total_cost])
+avg_heat = mean(results[:avg_heat_deg])
+
+println("\n=== Monte Carlo summary ===")
+println("Average % flow routed to PNA  = ", round(avg_pct_PNA, digits=2), " %")
+println("Fraction of runs building PNA = ", round(frac_built, digits=3))
+println("Total annual cost (mean/min/max) = \$", round(cost_mean, digits=0), " / \$", round(cost_min, digits=0), " / \$", round(cost_max, digits=0))
+println("Average heat added (°C, averaged over months and sims) = ", round(avg_heat, digits=3))
+
+# Plot 1: anammox efficiency curve vs temperature
+p1 = plot(temps_plot, eta_plot, xlabel="Temperature (°C)", ylabel="Anammox efficiency (frac)",
+    title="Anammox efficiency vs Temperature", lw=2)
+savefig(p1, "anammox_eff_vs_temp.png")
+
+# Plot 2: scatter sampled T vs %PNA (aggregate across all months & sims)
+mean_T_each_sim = [mean(results[:sampled_temps][i]) for i in 1:Nsim]
+pctPNA_each_sim = [results[:xPNA][i] * 100.0 for i in 1:Nsim]
+
+p2 = scatter(mean_T_each_sim, pctPNA_each_sim,
+    xlabel="Mean sampled temp across months (°C)", ylabel="% flow to PNA",
+    title="Sampled mean temp vs %PNA (each sim)", legend=false)
+savefig(p2, "sampledTemp_vs_pctPNA.png")
+
+# Plot 3: histogram of total annual cost
+p3 = histogram(results[:total_cost], bins=30, xlabel="Annual total cost (dollars)", ylabel="Frequency",
+    title="Distribution of Total Annual Cost (Monte Carlo)")
+savefig(p3, "cost_distribution.png")
+
+# Plot 4: fraction of sims that built PNA
+built_count = sum(results[:yPNA])
+p4 = bar(["Built PNA","Didn't build"], [built_count, Nsim - built_count],
+    xlabel="Decision", ylabel="Count", title="How often PNA was built across sims")
+savefig(p4, "pna_build_count.png")
+
+println("\nSaved plots: anammox_eff_vs_temp.png, sampledTemp_vs_pctPNA.png, cost_distribution.png, pna_build_count.png")
