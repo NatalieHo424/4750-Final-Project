@@ -23,12 +23,12 @@ eta_DNA_ref = 0.90
 # PNA parameters
 theta = 1.07
 T_ref = 20.0
-PNA_daily_limit = 60_000.0   # max kg N/day through PNA
+PNA_daily_limit = 10000.0   # max kg N/day through PNA
 
 # Energy costs
 e_DNA = fill(4.0, nT)
 e_PNA = fill(1.0, nT)
-heat_energy_per_deg = 0.0005
+heat_energy_per_deg = 0.006
 c_elec = 0.10
 
 # TN target
@@ -113,6 +113,24 @@ E_heat_base = [0.0 for m in 1:nT]
 E_total_base = [E_DNA_base[m] + E_PNA_base[m] + E_heat_base[m] for m in 1:nT]
 Cost_base = sum(days[m]*c_elec*E_total_base[m] for m in 1:nT)
 
+# Baseline: all flow to DNA
+R_DNA_base = [eta_DNA_ref * Lin for m in 1:nT]
+R_PNA_base = [0.0 for m in 1:nT]
+
+# Effluent TN
+Ceff_base = [(Lin - R_DNA_base[m] - R_PNA_base[m])/Q*1000 for m in 1:nT]
+
+# Energy usage
+E_DNA_base = [e_DNA[m] * R_DNA_base[m] for m in 1:nT]
+E_PNA_base = [0.0 for m in 1:nT]
+E_heat_base = [0.0 for m in 1:nT]
+E_total_base = [E_DNA_base[m] + E_PNA_base[m] + E_heat_base[m] for m in 1:nT]
+
+# Annual energy cost
+Cost_annual_DNA = sum(days[m] * c_elec * E_total_base[m] for m in 1:nT)
+println("Annual energy cost (all DNA, dollars): ", round(Cost_annual_DNA,digits=2))
+
+
 # ----------------------------
 # 5. Plotting
 # ----------------------------
@@ -145,6 +163,22 @@ plot3 = plot(months, xPNA_val.*100, labels=["% Flow to PNA"], lw=2, title="Flow 
 plot4 = plot(months, heat_val, labels=["Heat Added (°C)"], lw=2, title="Heating", xlabel="Month", ylabel="°C")
 
 plot(plot1, plot2, plot3, plot4, layout=(2,2), size=(900,600))
+# Monthly mean wastewater temperature
+T_mean = T_base  # or measured average per month
+
+months = 1:12
+
+plot(months, xPNA_val .* 100, lw=2, marker=:circle, label="% Flow to PNA", xlabel="Month",
+    ylabel="% Flow / Heat (°C)", title="Seasonal Trade-off: Flow vs Temperature")
+plot!(months, heat_val, lw=2, marker=:square, label="Heat added (°C)")
+plot!(months, T_mean, lw=2, linestyle=:dash, label="Influent Temp (°C)", color=:black)
+
+
+
+
+
+
+
 
 
 
