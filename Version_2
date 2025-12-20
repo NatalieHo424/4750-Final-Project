@@ -35,7 +35,20 @@ c_elec = 0.10
 TN_target = 10.0  # mg/L
 
 # Heating bounds
-M_heat = 20.0
+M_heat = 30.0
+
+# ----------------------------
+# NEW: 0b. CAPEX & GHG parameters (added)
+# ----------------------------
+AnnualCapex_PNA = 365_000.0    # $/year (annualized capex to add to annual objective)
+EF_elec = 0.40                 # kg CO2e per kWh (grid intensity)
+# N2O emissions factor: kg N2O-N produced per kg N removed in DNA (literature-based order-of-magnitude)
+EF_N2O_N_per_kgN = 0.003       # kg N2O-N / kg N removed (tunable)
+# Convert N2O-N -> N2O mass: multiply by (44/28) ; convert N2O -> CO2e by GWP100 (~298)
+GWP_N2O = 298.0
+# Combined factor: kg CO2e per kg N removed via DNA from N2O emissions
+EF_N2O_CO2e_per_kgN = EF_N2O_N_per_kgN * (44.0/28.0) * GWP_N2O  # kg CO2e per kg N removed (DNA)
+SCC = 80.0                     # $ per tCO2e (social cost of carbon)
 
 # ----------------------------
 # 1. Helper: linearized PNA efficiency
@@ -46,7 +59,7 @@ slopes = [(min(max(theta^(T_base[m]+Δ-T_ref)*0.85,0.01),0.99) -
            min(max(theta^(T_base[m]-Δ-T_ref)*0.85,0.01),0.99)) / (2*Δ) for m in 1:nT]
 
 # ----------------------------
-# 2. LP model (optimized routing)
+# 2. LP model (optimized routing) — unchanged except added y_PNA and GHG accounting
 # ----------------------------
 model = Model(HiGHS.Optimizer)
 
@@ -55,11 +68,15 @@ model = Model(HiGHS.Optimizer)
         0 <= x_DNA[m=1:nT] <= 1
         0 <= x_PNA[m=1:nT] <= 1
         0 <= heat_deg[m=1:nT] <= M_heat
+        y_PNA, Bin                # NEW: build decision (1 if we build PNA reactor)
     end
 )
 
 # Routing constraint
 @constraint(model, [m=1:nT], x_DNA[m] + x_PNA[m] == 1.0)
+
+# NEW: PNA can only receive flow if it is built
+@constraint(model, [m=1:nT], x_PNA[m] <= y_PNA)
 
 # PNA daily limit
 @constraint(model, [m=1:nT], x_PNA[m]*Lin <= PNA_daily_limit)
@@ -72,15 +89,33 @@ model = Model(HiGHS.Optimizer)
 @expression(model, Ceff[m=1:nT], (Lin - R_DNA[m] - R_PNA[m]) / Q * 1000)
 @constraint(model, [m=1:nT], Ceff[m] <= TN_target)
 
-# Energy
+# Energy (kWh/day)
 @expression(model, E_DNA[m=1:nT], e_DNA[m] * R_DNA[m])
 @expression(model, E_PNA[m=1:nT], e_PNA[m] * R_PNA[m])
 @expression(model, E_heat[m=1:nT], heat_deg[m] * heat_energy_per_deg * Q)
 @expression(model, E_total[m=1:nT], E_DNA[m] + E_PNA[m] + E_heat[m])
+
+# Annual energy cost (dollars)
 @expression(model, Cost_energy, sum(days[m]*c_elec*E_total[m] for m in 1:nT))
 
-# Objective: minimize annual energy cost
-@objective(model, Min, Cost_energy)
+# ----------------------------
+# NEW: GHG accounting (electricity + N2O from DNA)
+# ----------------------------
+# Electricity-related CO2e (kg CO2e/day)
+@expression(model, CO2_elec[m=1:nT], E_total[m] * EF_elec)
+# N2O-derived CO2e from DNA process (kg CO2e/day) - proportional to DNA N removed
+@expression(model, CO2_N2O_DNA[m=1:nT], R_DNA[m] * EF_N2O_CO2e_per_kgN)
+# Total CO2e per day
+@expression(model, CO2_total_kg_per_day[m=1:nT], CO2_elec[m] + CO2_N2O_DNA[m])
+# Annual GHG social cost ($) using SCC in $/ton CO2e
+@expression(model, Cost_GHG, sum(days[m] * CO2_total_kg_per_day[m] * (SCC / 1000.0) for m in 1:nT))
+
+# ----------------------------
+# NEW: Total annual cost = annualized capex (if built) + energy cost + GHG social cost
+# ----------------------------
+@expression(model, Capex_annual, y_PNA * AnnualCapex_PNA)
+
+@objective(model, Min, Capex_annual + Cost_energy + Cost_GHG)
 
 optimize!(model)
 
@@ -90,49 +125,50 @@ optimize!(model)
 xPNA_val = [value(x_PNA[m]) for m in 1:nT]
 xDNA_val = [value(x_DNA[m]) for m in 1:nT]
 heat_val = [value(heat_deg[m]) for m in 1:nT]
+yPNA_val = Int(round(value(y_PNA)))
 Ceff_val = [value(Ceff[m]) for m in 1:nT]
-Cost_opt = value(Cost_energy)
+Cost_energy_val = value(Cost_energy)
+Cost_GHG_val = value(Cost_GHG)
+Capex_val = value(Capex_annual)
+Cost_total = value(objective_value(model))
 E_total_val = [value(E_total[m]) for m in 1:nT]
 
-println("=== Optimized Routing ===")
+println("=== Optimized Routing with Capex & GHG ===")
+println("PNA built (y_PNA) = ", yPNA_val)
 println("x_PNA (% per month): ", round.(xPNA_val.*100,digits=1))
 println("x_DNA (% per month): ", round.(xDNA_val.*100,digits=1))
 println("Heat added (°C per month): ", round.(heat_val,digits=2))
 println("Effluent TN (mg/L per month): ", round.(Ceff_val,digits=2))
-println("Annual energy cost (dollars): ", round(Cost_opt,digits=2))
+println("Annual energy cost (dollars): ", round(Cost_energy_val,digits=2))
+println("Annual GHG social cost (dollars): ", round(Cost_GHG_val,digits=2))
+println("Annualized PNA capex included (dollars): ", round(Capex_val,digits=2))
+println("Total annual cost (energy + GHG + capex): \$", round(Cost_total,digits=2))
 
 # ----------------------------
-# 4. Baseline: all DNA
+# 4. Baseline: all DNA (for comparison)
 # ----------------------------
-R_DNA_base = [eta_DNA_ref*Lin for m in 1:nT]
-R_PNA_base = [0.0 for m in 1:nT]
-Ceff_base = [(Lin - R_DNA_base[m] - R_PNA_base[m])/Q*1000 for m in 1:nT]
-E_DNA_base = [e_DNA[m]*R_DNA_base[m] for m in 1:nT]
-E_PNA_base = [0.0 for m in 1:nT]
-E_heat_base = [0.0 for m in 1:nT]
-E_total_base = [E_DNA_base[m] + E_PNA_base[m] + E_heat_base[m] for m in 1:nT]
-Cost_base = sum(days[m]*c_elec*E_total_base[m] for m in 1:nT)
-
-# Baseline: all flow to DNA
 R_DNA_base = [eta_DNA_ref * Lin for m in 1:nT]
 R_PNA_base = [0.0 for m in 1:nT]
-
-# Effluent TN
 Ceff_base = [(Lin - R_DNA_base[m] - R_PNA_base[m])/Q*1000 for m in 1:nT]
 
-# Energy usage
 E_DNA_base = [e_DNA[m] * R_DNA_base[m] for m in 1:nT]
 E_PNA_base = [0.0 for m in 1:nT]
 E_heat_base = [0.0 for m in 1:nT]
 E_total_base = [E_DNA_base[m] + E_PNA_base[m] + E_heat_base[m] for m in 1:nT]
+Cost_annual_DNA = sum(days[m]*c_elec*E_total_base[m] for m in 1:nT)
 
-# Annual energy cost
-Cost_annual_DNA = sum(days[m] * c_elec * E_total_base[m] for m in 1:nT)
+# Baseline GHG
+CO2_elec_base = [E_total_base[m] * EF_elec for m in 1:nT]
+CO2_N2O_DNA_base = [R_DNA_base[m] * EF_N2O_CO2e_per_kgN for m in 1:nT]
+Cost_GHG_base = sum(days[m] * (CO2_elec_base[m] + CO2_N2O_DNA_base[m]) * (SCC / 1000.0) for m in 1:nT)
+
+println("\n=== Baseline (all DNA) ===")
 println("Annual energy cost (all DNA, dollars): ", round(Cost_annual_DNA,digits=2))
-
+println("Annual GHG social cost (all DNA, dollars): ", round(Cost_GHG_base,digits=2))
+println("Combined (energy + GHG) baseline: \$", round(Cost_annual_DNA + Cost_GHG_base, digits=2))
 
 # ----------------------------
-# 5. Plotting
+# 5. Plotting (unchanged)
 # ----------------------------
 months = 1:12
 
@@ -162,27 +198,46 @@ plot2 = plot(months, [Ceff_base, Ceff_val], labels=["All DNA","Optimized PNA"], 
 plot3 = plot(months, xPNA_val.*100, labels=["% Flow to PNA"], lw=2, title="Flow Split", xlabel="Month", ylabel="% Flow")
 plot4 = plot(months, heat_val, labels=["Heat Added (°C)"], lw=2, title="Heating", xlabel="Month", ylabel="°C")
 
-plot(plot1, plot2, plot3, plot4, layout=(2,2), size=(900,600))
+plot!(plot1, plot2, plot3, plot4, layout=(2,2), size=(900,600))
 # Monthly mean wastewater temperature
 T_mean = T_base  # or measured average per month
 
+plot1 = plot(months, [E_total_base.*days, E_total_val.*days],
+    labels=["All DNA" "Optimized PNA"], lw=2,
+    title="Monthly Energy Cost", xlabel="Month", ylabel="kWh")
+
+plot2 = plot(months, [Ceff_base, Ceff_val],
+    labels=["All DNA" "Optimized PNA"], lw=2,
+    title="Effluent TN", xlabel="Month", ylabel="mg/L")
+
+plot3 = plot(months, xPNA_val.*100,
+    labels="% Flow to PNA", lw=2,
+    title="Flow Split", xlabel="Month", ylabel="% Flow")
+
+plot4 = plot(months, heat_val,
+    labels="Heat Added (°C)", lw=2,
+    title="Heating", xlabel="Month", ylabel="°C")
+
+# --- combine all four into a single 2×2 grid ---
+gridplot = plot(
+    plot1, plot2, plot3, plot4,
+    layout=(2,2),
+    size=(1200,900)
+)
+
+# --- export as PNG ---
+savefig(gridplot, "annual_results_grid.png")
+
+println("Saved 2x2 plot grid as: annual_results_grid.png")
+
+
 months = 1:12
 
-plot(months, xPNA_val .* 100, lw=2, marker=:circle, label="% Flow to PNA", xlabel="Month",
+plot5 = plot(months, xPNA_val .* 100, lw=2, marker=:circle, label="% Flow to PNA", xlabel="Month",
     ylabel="% Flow / Heat (°C)", title="Seasonal Trade-off: Flow vs Temperature")
 plot!(months, heat_val, lw=2, marker=:square, label="Heat added (°C)")
 plot!(months, T_mean, lw=2, linestyle=:dash, label="Influent Temp (°C)", color=:black)
 
-
-
-
-
-
-
-
-
-
-
-
+savefig(plot5, "finalannamoxmonthlyresults.png")
 
 
